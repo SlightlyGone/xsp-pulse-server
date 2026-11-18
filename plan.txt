@@ -1,0 +1,366 @@
+Building a stripped-down, read-only "Hello XSP Price" mini-project from scratch is the best way to master Kotlin syntax, Jetpack Compose, Ktor, and FastAPI without getting lost in order-management complexity. Because it only reads the live price of XSP, it is completely safe to run against your production tastytrade account.
+Let's name this mini-project XspPulse. Below is your complete, step-by-step blueprint across all five layers—from the Python backend up to the Android and Desktop screens and automated tests.
+
+Layer 0: Workspace & Project Setup
+
+Keep this completely separate from Slipstream Lab so you can experiment freely.
+• Backend Folder (C:\Projects\xsp-pulse-server): Create a standard folder for your Python server and open it in VS Code (or your preferred editor).
+• Frontend Folder (C:\Projects\XspPulseKmp): Generate a clean Kotlin Multiplatform template at jetbrains.com with Project Name XspPulseKmp, Project ID com.xsppulse.app, and Android + Desktop checked (with Share UI selected). Unzip it directly into C:\Projects\XspPulseKmp (so settings.gradle.kts sits right at the top level) and open it in Android Studio.
+
+Layer 1: The Python Backend (tastytrade + FastAPI)
+
+Your backend has two distinct responsibilities: talking to tastytrade (tasty_worker.py) and serving that price to your apps (server.py).
+
+1. Install Dependencies
+
+In C:\Projects\xsp-pulse-server, create requirements.txt and run pip install -r requirements.txt:
+text
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+tastytrade>=9.0
+pydantic>=2.0
+pytest>=8.0
+httpx>=0.27.0
+Use code with caution.
+
+2. The tastytrade Streamer Module (tasty_worker.py)
+
+This module runs a 24/7 background loop that authenticates with your production tastytrade OAuth credentials and streams live XSP quotes into memory. (Note: Outside US market hours, DXLink will send the last closing bid/ask or remain quiet until pre-market/open).
+python
+import asyncio
+import os
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional
+from pydantic import BaseModel
+from tastytrade import Session, DXLinkStreamer
+from tastytrade.dxfeed import Quote
+
+
+class PriceSnapshot(BaseModel):
+    symbol: str = "XSP"
+    bid: Optional[str] = None
+    ask: Optional[str] = None
+    mid: Optional[str] = None
+    status: str = "DISCONNECTED"
+    updated_at: str = ""
+
+
+class XspPriceWorker:
+    def __init__(self) -> None:
+        self.latest = PriceSnapshot()
+        self._task: Optional[asyncio.Task] = None
+
+    def compute_mid(self, bid: float | None, ask: float | None) -> Optional[str]:
+        if bid is None or ask is None:
+            return None
+        mid_val = (Decimal(str(bid)) + Decimal(str(ask))) / Decimal("2")
+        return f"{mid_val:.2f}"
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._stream_loop())
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+
+    async def _stream_loop(self) -> None:
+        secret = os.environ["TT_CLIENT_SECRET"]
+        refresh = os.environ["TT_REFRESH_TOKEN"]
+
+        while True:
+            try:
+                self.latest.status = "CONNECTING"
+                session = Session(provider_secret=secret, refresh_token=refresh, is_test=False)
+                async with DXLinkStreamer(session) as streamer:
+                    await streamer.subscribe(Quote, ["XSP"])
+                    self.latest.status = "STREAMING"
+                    async for quote in streamer.listen(Quote):
+                        if quote.event_symbol != "XSP":
+                            continue
+                        mid = self.compute_mid(quote.bid_price, quote.ask_price)
+                        self.latest = PriceSnapshot(
+                            symbol="XSP",
+                            bid=f"{quote.bid_price:.2f}" if quote.bid_price else None,
+                            ask=f"{quote.ask_price:.2f}" if quote.ask_price else None,
+                            mid=mid,
+                            status="STREAMING",
+                            updated_at=datetime.now(timezone.utc).isoformat(),
+                        )
+            except asyncio.CancelledError:
+                self.latest.status = "STOPPED"
+                break
+            except Exception as exc:
+                self.latest.status = f"RECONNECTING ({exc})"
+                await asyncio.sleep(5)
+Use code with caution.
+
+3. The FastAPI Wrapper (server.py)
+
+This exposes a single REST endpoint (GET /price/xsp) so your Kotlin apps can ask for the latest XSP price on demand.
+python
+import os
+from contextlib import asynccontextmanager
+from fastapi import Depends, FastAPI, Header, HTTPException
+from tasty_worker import PriceSnapshot, XspPriceWorker
+
+worker = XspPriceWorker()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await worker.start()
+    yield
+    await worker.stop()
+
+
+app = FastAPI(title="XSP Pulse Server", lifespan=lifespan)
+
+
+def verify_key(authorization: str = Header(default="")) -> None:
+    expected = f"Bearer {os.environ.get('APP_API_KEY', 'dev-secret')}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True}
+
+
+@app.get("/price/xsp", response_model=PriceSnapshot, dependencies=[Depends(verify_key)])
+def get_xsp_price() -> PriceSnapshot:
+    return worker.latest
+Use code with caution.
+
+Layer 2: Kotlin Multiplatform Shared Code (composeApp/src/commonMain)
+
+Now switch to Android Studio. Every Kotlin concept you need here maps directly to Python:
+• data class = Python @dataclass / Pydantic BaseModel
+• suspend fun = Python async def
+• StateFlow = A reactive variable that automatically notifies your UI when updated
+
+1. Shared Data Model (PriceSnapshot.kt)
+
+Create composeApp/src/commonMain/kotlin/com/xsppulse/app/model/PriceSnapshot.kt. Notice how @SerialName("updated_at") maps Python's snake_case JSON field into Kotlin's camelCase property:
+kotlin
+package com.xsppulse.app.model
+
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class PriceSnapshot(
+    val symbol: String = "XSP",
+    val bid: String? = null,
+    val ask: String? = null,
+    val mid: String? = null,
+    val status: String = "IDLE",
+    @SerialName("updated_at") val updatedAt: String = ""
+)
+Use code with caution.
+
+2. Ktor Network Client (XspApiClient.kt)
+
+Create composeApp/src/commonMain/kotlin/com/xsppulse/app/network/XspApiClient.kt. This sends an HTTP GET request to your FastAPI server and parses the JSON into PriceSnapshot:
+kotlin
+package com.xsppulse.app.network
+
+import com.xsppulse.app.model.PriceSnapshot
+import io.ktor.client.HttpClient
+import io.ktor.client.call.body
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.serialization.json.Json
+
+class XspApiClient(
+    private val baseUrl: String,
+    private val apiKey: String,
+    private val httpClient: HttpClient = defaultHttpClient()
+) {
+    suspend fun fetchXspPrice(): PriceSnapshot {
+        return httpClient.get("$baseUrl/price/xsp") {
+            header("Authorization", "Bearer $apiKey")
+        }.body()
+    }
+
+    companion object {
+        fun defaultHttpClient(): HttpClient = HttpClient {
+            install(ContentNegotiation) {
+                json(Json {
+                    ignoreUnknownKeys = true
+                    isLenient = true
+                })
+            }
+        }
+    }
+}
+Use code with caution.
+
+Layer 3: Shared Compose UI (App.kt for Both Android & Desktop)
+
+In composeApp/src/commonMain/kotlin/com/xsppulse/app/App.kt, write the UI once. In Jetpack Compose, UI is declared as functions (@Composable), and rememberCoroutineScope() lets a button click run an async network request without freezing the screen:
+kotlin
+package com.xsppulse.app
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.xsppulse.app.model.PriceSnapshot
+import com.xsppulse.app.network.XspApiClient
+import kotlinx.coroutines.launch
+
+@Composable
+fun App(serverUrl: String) {
+    val client = remember { XspApiClient(baseUrl = serverUrl, apiKey = "dev-secret") }
+    val scope = rememberCoroutineScope()
+
+    var snapshot by remember { mutableStateOf(PriceSnapshot()) }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+
+    MaterialTheme {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text("XSP Live Pulse", style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(16.dp))
+
+                Text(
+                    text = "Mid: $${snapshot.mid ?: "--.--"}",
+                    style = MaterialTheme.typography.displaySmall
+                )
+                Text("Bid: ${snapshot.bid ?: "--"}  |  Ask: ${snapshot.ask ?: "--"}")
+                Text("Server Status: ${snapshot.status}", style = MaterialTheme.typography.bodySmall)
+
+                if (errorText != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Error: $errorText", color = MaterialTheme.colorScheme.error)
+                }
+
+                Spacer(Modifier.height(24.dp))
+
+                Button(
+                    enabled = !isLoading,
+                    onClick = {
+                        scope.launch {
+                            isLoading = true
+                            errorText = null
+                            try {
+                                snapshot = client.fetchXspPrice()
+                            } catch (e: Exception) {
+                                errorText = e.message ?: "Request failed"
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (isLoading) "Fetching..." else "Get XSP Price")
+                }
+            }
+        }
+    }
+}
+Use code with caution.
+
+Platform Entry Points (Why serverUrl Is Passed In)
+
+• Windows Desktop (desktopMain/.../main.kt): Passes App(serverUrl = "http://127.0.0.1:8000") because the desktop app runs on the same PC as your local Python server.
+• Android Emulator (androidMain/.../MainActivity.kt): Passes App(serverUrl = "http://10.0.2.2:8000") because inside the Android Emulator, 10.0.2.2 is the special IP alias that routes to your Windows PC's localhost. (Once deployed behind Cloudflare Tunnel, both platforms simply use "https://yourdomain.com").
+
+Layer 4: Unit Tests & End-to-End Tests
+
+Writing tests at each layer proves your logic works before you ever open an emulator.
+
+1. Python Unit & API Test (test_server.py)
+
+Using pytest and FastAPI's TestClient, you can verify your midpoint math and API key security without connecting to tastytrade:
+python
+from fastapi.testclient import TestClient
+from server import app, worker
+
+client = TestClient(app)
+
+
+def test_mid_calculation():
+    assert worker.compute_mid(580.10, 580.30) == "580.20"
+    assert worker.compute_mid(None, 580.30) is None
+
+
+def test_unauthorized_request_rejected():
+    res = client.get("/price/xsp")
+    assert res.status_code == 401
+
+
+def test_authorized_price_snapshot():
+    worker.latest.mid = "581.45"
+    worker.latest.status = "STREAMING"
+    res = client.get("/price/xsp", headers={"Authorization": "Bearer dev-secret"})
+    assert res.status_code == 200
+    assert res.json()["mid"] == "581.45"
+Use code with caution.
+
+2. Kotlin Unit Test (XspApiClientTest.kt)
+
+In composeApp/src/commonTest/kotlin/com/xsppulse/app/XspApiClientTest.kt, use Ktor's MockEngine to test JSON deserialization and Authorization header injection offline:
+kotlin
+package com.xsppulse.app
+
+import com.xsppulse.app.network.XspApiClient
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.headersOf
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class XspApiClientTest {
+
+    @Test
+    fun parsesXspSnapshotFromServerJson() = runTest {
+        val mockEngine = MockEngine { request ->
+            assertEquals("Bearer test-key", request.headers["Authorization"])
+            respond(
+                content = """{"symbol":"XSP","bid":"582.10","ask":"582.30","mid":"582.20","status":"STREAMING","updated_at":"2026-11-16T15:00:00Z"}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+
+        val testHttpClient = HttpClient(mockEngine) {
+            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
+        }
+
+        val api = XspApiClient("http://localhost:8000", "test-key", testHttpClient)
+        val result = api.fetchXspPrice()
+
+        assertEquals("582.20", result.mid)
+        assertEquals("STREAMING", result.status)
+    }
+}
+Use code with caution.
+
+3. End-to-End Verification Checklist
+
+1. Run Python Tests: Run pytest in C:\Projects\xsp-pulse-server and confirm all 3 tests pass.
+2. Start Production Streamer Locally: Set your environment variables (TT_CLIENT_SECRET, TT_REFRESH_TOKEN, APP_API_KEY=dev-secret) and run uvicorn server:app --host 0.0.0.0 --port 8000.
+3. Run Kotlin Tests: Run ./gradlew desktopTest in XspPulseKmp to confirm the Ktor client parses JSON properly.
+4. Launch Desktop & Android: Run the Desktop app and click Get XSP Price (http://127.0.0.1:8000), then launch the Android Emulator and click Get XSP Price (http://10.0.2.2:8000) to verify both UIs display the live XSP quote from your server.
+Which layer would you like to build and test first:
+• Layer 1 (Python Server): Setting up tasty_worker.py, server.py, and running pytest against your production tastytrade credentials?
+• Layer 2 & 3 (Kotlin Multiplatform): Generating the XspPulseKmp template and walking through the Kotlin build.gradle.kts dependencies and Compose UI syntax?
