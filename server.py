@@ -19,7 +19,7 @@ app = FastAPI(title="XSP Pulse Server", lifespan=lifespan)
 
 
 def verify_key(authorization: str = Header(default="")) -> None:
-    expected = f"Bearer {os.environ.get('APP_API_KEY', 'my-local-test-key')}"
+    expected = f"Bearer {os.environ.get('APP_API_KEY', 'redacted')}"
     if authorization != expected:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
