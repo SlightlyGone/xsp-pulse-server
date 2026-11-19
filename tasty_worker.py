@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -8,6 +9,9 @@ from tastytrade import DXLinkStreamer, Session
 from tastytrade.dxfeed import Quote, Trade
 from tastytrade.instruments import Future
 from tastytrade.utils import TastytradeError
+
+
+logger = logging.getLogger(__name__)
 
 
 class PriceSnapshot(BaseModel):
@@ -58,14 +62,17 @@ class XspPriceWorker:
         secret = os.environ.get("TASTYTRADE_CLIENT_SECRET", "")
         refresh = os.environ.get("TASTYTRADE_REFRESH_TOKEN", "")
         if not secret or not refresh:
-            self.latest.status = "MISSING_CREDENTIALS"
+            self._set_all_status("MISSING_CREDENTIALS")
+            logger.warning("Market data credentials are missing")
             return
 
         while True:
             try:
-                self.latest.status = "CONNECTING"
+                self._set_all_status("CONNECTING")
+                phase = "session setup"
                 session = Session(provider_secret=secret, refresh_token=refresh, is_test=False)
 
+                phase = "future selection"
                 futures = await Future.get(session, product_codes=["ES"])
                 active_future = next(f for f in futures if f.active_month)
                 es_stream_symbol = active_future.streamer_symbol
@@ -75,6 +82,7 @@ class XspPriceWorker:
                     es_stream_symbol: ("ES", active_future.symbol),
                 }
 
+                phase = "streaming"
                 async with DXLinkStreamer(session) as streamer:
                     await streamer.subscribe(Quote, list(quote_map.keys()))
                     await streamer.subscribe(Trade, ["XSP"])
@@ -115,8 +123,14 @@ class XspPriceWorker:
 
                     await asyncio.gather(listen_quotes(), listen_trades())
             except asyncio.CancelledError:
-                self.latest.status = "STOPPED"
+                self._set_all_status("STOPPED")
                 break
             except (TastytradeError, OSError, TimeoutError) as exc:
-                self.latest.status = f"RECONNECTING ({exc})"
-                await asyncio.sleep(5)
+                category = "authentication or service error" if isinstance(exc, TastytradeError) else "network or timeout error"
+                logger.warning("Market data %s failed (%s); retrying in 5 seconds", phase, category)
+                self._set_all_status("RECONNECTING")
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    self._set_all_status("STOPPED")
+                    break
