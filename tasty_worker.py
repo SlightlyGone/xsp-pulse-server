@@ -1,8 +1,12 @@
 import asyncio
 import logging
+import math
 import os
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from threading import Lock
 
 from pydantic import BaseModel
 from tastytrade import DXLinkStreamer, Session
@@ -22,8 +26,29 @@ class PriceSnapshot(BaseModel):
     status: str = "DISCONNECTED"
     updated_at: str = ""
 
+
 class XspPriceWorker:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._monotonic = monotonic
+        self._utc_now = utc_now
+        self._lock = Lock()  # API reads run in FastAPI's thread pool.
+        self.connection_status = "DISCONNECTED"
+        self._received_at: dict[str, float] = {}
+        self.freshness_seconds: dict[str, float] = {}
+        for key, default in (("SPY", 120), ("XSP", 900), ("ES", 120)):
+            name = f"{key}_FRESHNESS_SECONDS"
+            try:
+                threshold = float(os.environ.get(name, str(default)))
+            except ValueError:
+                raise ValueError(f"{name} must be a finite positive number") from None
+            if not math.isfinite(threshold) or threshold <= 0:
+                raise ValueError(f"{name} must be a finite positive number")
+            self.freshness_seconds[key] = threshold
         self.snapshots: dict[str, PriceSnapshot] = {
             "SPY": PriceSnapshot(symbol="SPY"),
             "XSP": PriceSnapshot(symbol="XSP"),
@@ -33,13 +58,36 @@ class XspPriceWorker:
 
     @property
     def latest(self) -> PriceSnapshot:
-        return self.snapshots["SPY"]
+        return self.get_snapshot("SPY")
+
+    def observation_age(self, symbol: str) -> float | None:
+        """Local receipt age, not exchange latency or connection health."""
+        key = symbol.upper().lstrip("/")
+        with self._lock:
+            if key not in self.snapshots:
+                raise KeyError(f"Unknown symbol: {symbol}")
+            received = self._received_at.get(key)
+            return None if received is None else max(0.0, self._monotonic() - received)
 
     def get_snapshot(self, symbol: str) -> PriceSnapshot:
         key = symbol.upper().lstrip("/")
-        if key not in self.snapshots:
-            raise KeyError(f"Unknown symbol: {symbol}")
-        return self.snapshots[key]    
+        with self._lock:
+            if key not in self.snapshots:
+                raise KeyError(f"Unknown symbol: {symbol}")
+            status = self.connection_status
+            if status == "STREAMING":
+                received = self._received_at.get(key)
+                if received is None:
+                    status = "WAITING_FOR_DATA"
+                elif self._monotonic() - received > self.freshness_seconds[key]:
+                    status = "STALE"
+            return self.snapshots[key].model_copy(update={"status": status})
+
+    def _record_snapshot(self, key: str, snapshot: PriceSnapshot) -> None:
+        with self._lock:
+            snapshot.updated_at = self._utc_now().isoformat()
+            self._received_at[key] = self._monotonic()
+            self.snapshots[key] = snapshot
 
     def compute_mid(self, bid: float | None, ask: float | None) -> str | None:
         if bid is None or ask is None:
@@ -53,10 +101,17 @@ class XspPriceWorker:
     async def stop(self) -> None:
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._set_all_status("STOPPED")
 
     def _set_all_status(self, status: str) -> None:
-        for snap in self.snapshots.values():
-            snap.status = status
+        with self._lock:
+            self.connection_status = status
+            for snap in self.snapshots.values():
+                snap.status = status
 
     async def _stream_loop(self) -> None:
         secret = os.environ.get("TASTYTRADE_CLIENT_SECRET", "")
@@ -86,9 +141,10 @@ class XspPriceWorker:
                 async with DXLinkStreamer(session) as streamer:
                     await streamer.subscribe(Quote, list(quote_map.keys()))
                     await streamer.subscribe(Trade, ["XSP"])
-                    self.snapshots["SPY"].symbol = "SPY"
-                    self.snapshots["XSP"].symbol = "XSP"
-                    self.snapshots["ES"].symbol = active_future.symbol
+                    with self._lock:
+                        self.snapshots["SPY"].symbol = "SPY"
+                        self.snapshots["XSP"].symbol = "XSP"
+                        self.snapshots["ES"].symbol = active_future.symbol
                     self._set_all_status("STREAMING")
 
                     async def listen_quotes(quote_map=quote_map) -> None:
@@ -98,28 +154,26 @@ class XspPriceWorker:
                                 continue    
                             cache_key, display_symbol = mapping
                             mid = self.compute_mid(quote.bid_price, quote.ask_price)
-                            self.snapshots[cache_key] = PriceSnapshot(
+                            self._record_snapshot(cache_key, PriceSnapshot(
                                 symbol=display_symbol,
                                 bid=f"{quote.bid_price:.2f}" if quote.bid_price else None,
                                 ask=f"{quote.ask_price:.2f}" if quote.ask_price else None,
                                 mid=mid,
                                 status="STREAMING",
-                                updated_at=datetime.now(UTC).isoformat(),
-                            )
+                            ))
 
                     async def listen_trades() -> None:
                         async for trade in streamer.listen(Trade):
                             if trade.event_symbol != "XSP" or trade.price is None:
                                 continue
                             price_str = f"{Decimal(str(trade.price)):.2f}"
-                            self.snapshots["XSP"] = PriceSnapshot(
+                            self._record_snapshot("XSP", PriceSnapshot(
                                 symbol="XSP",
                                 bid=price_str,
                                 ask=price_str,
                                 mid=price_str,
                                 status="STREAMING",
-                                updated_at=datetime.now(UTC).isoformat(),
-                            )
+                            ))
 
                     await asyncio.gather(listen_quotes(), listen_trades())
             except asyncio.CancelledError:

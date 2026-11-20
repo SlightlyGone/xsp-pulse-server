@@ -1,6 +1,8 @@
 ﻿from fastapi.testclient import TestClient
 
+import server
 from server import app, worker
+from tasty_worker import PriceSnapshot, XspPriceWorker
 
 client = TestClient(app)
 
@@ -17,8 +19,11 @@ def test_unauthorized_request_rejected():
 
 def test_authorized_price_snapshot(monkeypatch) -> None:
     monkeypatch.setenv("APP_API_KEY", "dev-secret")
-    worker.latest.mid = "581.45"
-    worker.latest.status = "STREAMING"
+    isolated = XspPriceWorker()
+    isolated._set_all_status("STREAMING")
+    isolated._record_snapshot("SPY", PriceSnapshot(mid="581.45"))
+    monkeypatch.setattr(server, "worker", isolated)
     res = client.get("/price/xsp", headers={"Authorization": "Bearer dev-secret"})
     assert res.status_code == 200
     assert res.json()["mid"] == "581.45"
+    assert res.json()["status"] == "STREAMING"

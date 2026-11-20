@@ -57,7 +57,7 @@ for symbol in ('SPY', 'XSP', 'ES'):
 PY
 ```
 
-Check each response for its expected symbol, `STREAMING`, populated prices and a plausible `updated_at`; quiet markets can yield old data. The ES response displays the selected contract symbol. Review logs before sharing them: third-party libraries or older versions may emit sensitive details.
+Check each response for its expected symbol, status, populated prices and a plausible `updated_at`. With the freshness-reporting change deployed, API reads report `STALE` when the last local receipt exceeds its threshold, or `WAITING_FOR_DATA` before an initial event. Neither status establishes connection failure: quiet markets, closures and scheduled breaks can yield old or absent observations. See [freshness configuration and limitations](../README.md#observation-freshness) before interpreting these as an outage; thresholds are optional environment settings and require worker restart to take effect. The ES response displays the selected contract symbol. Review logs before sharing them: third-party libraries or older versions may emit sensitive details.
 
 ## Update from GitHub
 
