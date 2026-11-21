@@ -1,3 +1,4 @@
+from test_support import SessionDouble
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -206,7 +207,7 @@ def test_serial_recovery_cleans_tasks_recreates_session_and_shuts_down(make_work
         attempts.append(clock.elapsed)
         if 1 < len(attempts) <= 1 + failures:
             raise OSError("credential-secret-marker")
-        return object()
+        return SessionDouble()
 
     async def future_get(session, product_codes):
         return [SimpleNamespace(active_month=True, streamer_symbol="/ESZ6:XCME", symbol="/ESZ6")]
@@ -294,7 +295,7 @@ def test_ordinary_recovery_requires_confirmed_streamer_exit(make_worker, monkeyp
     def session(**kwargs):
         assert not any(s.open for s in instances)
         attempts.append(True)
-        return object()
+        return SessionDouble()
 
     async def futures(session, product_codes):
         return [SimpleNamespace(active_month=True, streamer_symbol="es", symbol="/ESZ6")]
@@ -509,7 +510,7 @@ def test_healthy_connection_resets_retry_backoff(make_worker, monkeypatch, enabl
         attempts.append(True)
         if len(attempts) != 2:
             raise OSError("secret-marker")
-        return object()
+        return SessionDouble()
 
     async def futures(session, product_codes):
         return [SimpleNamespace(active_month=True, streamer_symbol="/ESZ6:XCME", symbol="/ESZ6")]
@@ -658,7 +659,7 @@ def test_shutdown_teardown_error_cannot_reconnect_or_sleep(make_worker, monkeypa
 
     def session(**kwargs):
         attempts.append(True)
-        return object()
+        return SessionDouble()
 
     async def futures(session, product_codes):
         return [SimpleNamespace(active_month=True, streamer_symbol="es", symbol="/ESZ6")]
@@ -764,7 +765,7 @@ def test_hanging_cleanup_warns_without_overlap_or_forced_close(make_worker, monk
 
     def session(**kwargs):
         attempts.append(True)
-        return object()
+        return SessionDouble()
 
     async def futures(session, product_codes):
         return [SimpleNamespace(active_month=True, streamer_symbol="es", symbol="/ESZ6")]

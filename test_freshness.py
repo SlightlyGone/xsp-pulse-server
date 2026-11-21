@@ -1,3 +1,4 @@
+from test_support import SessionDouble
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -159,7 +160,7 @@ def test_listeners_record_receipt_and_preserve_subscriptions(observed, monkeypat
     worker, clock = observed
     monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "fake-secret")
     monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "fake-refresh")
-    monkeypatch.setattr(tasty_worker, "Session", lambda **kwargs: object())
+    monkeypatch.setattr(tasty_worker, "Session", lambda **kwargs: SessionDouble())
 
     async def futures(session, product_codes):
         assert product_codes == ["ES"]

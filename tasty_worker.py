@@ -18,7 +18,6 @@ from tastytrade.utils import TastytradeError
 
 from es_schedule import calendar_expired, es_session_start
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -182,6 +181,29 @@ class XspPriceWorker:
         )
 
     @asynccontextmanager
+    async def _session_context(self, secret, refresh):
+        manager = Session(provider_secret=secret, refresh_token=refresh, is_test=False)
+        session = await manager.__aenter__()
+        try:
+            yield session
+        except BaseException as exc:
+            if not await self._close_session(manager, type(exc), exc, exc.__traceback__):
+                raise
+        else:
+            await self._close_session(manager, None, None, None)
+
+    async def _close_session(self, manager, exc_type, exc, traceback):
+        warning = self._schedule_cleanup_warning("Session HTTP client")
+        try:
+            return await manager.__aexit__(exc_type, exc, traceback)
+        except BaseException:
+            self._closure_failed = True
+            logger.error("Market data Session cleanup unconfirmed; recovery suppressed for worker lifetime")
+            raise StreamerClosureFailed from None
+        finally:
+            warning.cancel()
+
+    @asynccontextmanager
     async def _streamer_context(self, session):
         # Keep SDK enter/exit on the owning task (including AnyIO cancel scopes).
         manager = DXLinkStreamer(session)
@@ -275,73 +297,73 @@ class XspPriceWorker:
             try:
                 self._set_all_status("RECOVERING" if recovering else "CONNECTING")
                 phase = "session setup"
-                session = Session(provider_secret=secret, refresh_token=refresh, is_test=False)
+                async with self._session_context(secret, refresh) as session:
 
-                phase = "future selection"
-                futures = await Future.get(session, product_codes=["ES"])
-                if self._shutdown_requested:
-                    break
-                active_future = next(f for f in futures if f.active_month)
-                es_stream_symbol = active_future.streamer_symbol
-
-                quote_map: dict[str, tuple[str, str]] = {
-                    "SPY": ("SPY", "SPY"),
-                    es_stream_symbol: ("ES", active_future.symbol),
-                }
-
-                phase = "streaming"
-                listener_error = None
-                async with self._streamer_context(session) as streamer:
-                    await streamer.subscribe(Quote, list(quote_map.keys()))
+                    phase = "future selection"
+                    futures = await Future.get(session, product_codes=["ES"])
                     if self._shutdown_requested:
-                        raise asyncio.CancelledError
-                    await streamer.subscribe(Trade, ["XSP"])
-                    if self._shutdown_requested:
-                        raise asyncio.CancelledError
-                    with self._lock:
-                        self.snapshots["SPY"].symbol = "SPY"
-                        self.snapshots["XSP"].symbol = "XSP"
-                        self.snapshots["ES"].symbol = active_future.symbol
-                    self._set_all_status("STREAMING")
-                    recovering = False
-                    connected_at = self._monotonic()
+                        break
+                    active_future = next(f for f in futures if f.active_month)
+                    es_stream_symbol = active_future.streamer_symbol
 
-                    async def listen_quotes(quote_map=quote_map) -> None:
-                        async for quote in streamer.listen(Quote):
-                            mapping = quote_map.get(quote.event_symbol)
-                            if not mapping:
-                                continue    
-                            cache_key, display_symbol = mapping
-                            mid = self.compute_mid(quote.bid_price, quote.ask_price)
-                            self._record_snapshot(cache_key, PriceSnapshot(
-                                symbol=display_symbol,
-                                bid=f"{quote.bid_price:.2f}" if quote.bid_price else None,
-                                ask=f"{quote.ask_price:.2f}" if quote.ask_price else None,
-                                mid=mid,
-                                status="STREAMING",
-                            ))
+                    quote_map: dict[str, tuple[str, str]] = {
+                        "SPY": ("SPY", "SPY"),
+                        es_stream_symbol: ("ES", active_future.symbol),
+                    }
 
-                    async def listen_trades() -> None:
-                        async for trade in streamer.listen(Trade):
-                            if trade.event_symbol != "XSP" or trade.price is None:
-                                continue
-                            price_str = f"{Decimal(str(trade.price)):.2f}"
-                            self._record_snapshot("XSP", PriceSnapshot(
-                                symbol="XSP",
-                                bid=price_str,
-                                ask=price_str,
-                                mid=price_str,
-                                status="STREAMING",
-                            ))
+                    phase = "streaming"
+                    listener_error = None
+                    async with self._streamer_context(session) as streamer:
+                        await streamer.subscribe(Quote, list(quote_map.keys()))
+                        if self._shutdown_requested:
+                            raise asyncio.CancelledError
+                        await streamer.subscribe(Trade, ["XSP"])
+                        if self._shutdown_requested:
+                            raise asyncio.CancelledError
+                        with self._lock:
+                            self.snapshots["SPY"].symbol = "SPY"
+                            self.snapshots["XSP"].symbol = "XSP"
+                            self.snapshots["ES"].symbol = active_future.symbol
+                        self._set_all_status("STREAMING")
+                        recovering = False
+                        connected_at = self._monotonic()
 
-                    try:
-                        await self._run_listeners(listen_quotes(), listen_trades())
-                    except (StreamStalled, TastytradeError, OSError, TimeoutError) as exc:
-                        # Exit the SDK's task group normally: otherwise some SDK
-                        # versions wrap our deliberate stall in ExceptionGroup.
-                        listener_error = exc
-                if listener_error is not None:
-                    raise listener_error
+                        async def listen_quotes(quote_map=quote_map) -> None:
+                            async for quote in streamer.listen(Quote):
+                                mapping = quote_map.get(quote.event_symbol)
+                                if not mapping:
+                                    continue
+                                cache_key, display_symbol = mapping
+                                mid = self.compute_mid(quote.bid_price, quote.ask_price)
+                                self._record_snapshot(cache_key, PriceSnapshot(
+                                    symbol=display_symbol,
+                                    bid=f"{quote.bid_price:.2f}" if quote.bid_price else None,
+                                    ask=f"{quote.ask_price:.2f}" if quote.ask_price else None,
+                                    mid=mid,
+                                    status="STREAMING",
+                                ))
+
+                        async def listen_trades() -> None:
+                            async for trade in streamer.listen(Trade):
+                                if trade.event_symbol != "XSP" or trade.price is None:
+                                    continue
+                                price_str = f"{Decimal(str(trade.price)):.2f}"
+                                self._record_snapshot("XSP", PriceSnapshot(
+                                    symbol="XSP",
+                                    bid=price_str,
+                                    ask=price_str,
+                                    mid=price_str,
+                                    status="STREAMING",
+                                ))
+
+                        try:
+                            await self._run_listeners(listen_quotes(), listen_trades())
+                        except (StreamStalled, TastytradeError, OSError, TimeoutError) as exc:
+                            # Exit the SDK's task group normally: otherwise some SDK
+                            # versions wrap our deliberate stall in ExceptionGroup.
+                            listener_error = exc
+                    if listener_error is not None:
+                        raise listener_error
             except StreamerClosureFailed:
                 self._set_all_status("STOPPED" if self._shutdown_requested else "CLEANUP_FAILED")
                 return

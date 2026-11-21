@@ -138,6 +138,49 @@ OAuth/network payloads. Third-party debug logging remains outside this guarantee
 
 ## Limitations and rollback
 
+### Authentication lifecycle (SDK 13.2.3)
+
+The deployment dependency is pinned to `tastytrade==13.2.3`. Each attempt owns a
+Session async context, outside the streamer context. Its HTTP client closes
+before retry sleep/new Session creation and on failure or shutdown. Session exit
+errors latch `CLEANUP_FAILED` just like uncertain streamer closure; no replacement
+is opened. Pending Session cleanup has the same 30-second diagnostic as streamer
+cleanup, without forced timeout or replacement.
+
+SDK Session refreshes REST OAuth access tokens lazily before requests, with a
+60-second expiry buffer. Its DXLink streamer obtains a separate quote token on
+entry, but does not renew that token on an established stream. Retrying a failed
+quote-token request before streamer entry can safely create a fresh Session once
+the previous Session exits normally. Existing watchdog recovery after successful
+streamer closure also obtains new Session/quote credentials.
+
+**Automatic recovery from a background-reader authentication error remains
+unsupported safely by this SDK interface.** Its AnyIO task group can propagate
+the reader error through `__aexit__` after resource cleanup. SDK 13.2.3 exposes no
+public successful-close acknowledgement separate from this exception. The worker
+therefore preserves the permanent `CLEANUP_FAILED` latch even when cleanup may
+have succeeded; it never classifies closure from an auth message or error type.
+Integrated offline tests run the real SDK reader/task group/context with fake
+HTTP and websocket transports for both completed and failed socket cleanup.
+
+SDK `TastytradeError` flattens OAuth response codes into text and provides no
+structured code/status field. Consequently revoked grants and bad client
+credentials are not reliably classified as permanent: they retain bounded
+backoff when the watchdog is enabled (fixed five seconds in disabled mode).
+Do not parse exception strings to bypass either authentication or cleanup policy.
+Offline refresh tests use the real SDK and verify the expiry buffer, concurrent
+refresh, rejected grants/credentials, and HTTP-client disposal between attempts.
+Third-party SDK debug logging may include raw messages; keep it disabled when
+handling credentials, independently of the worker's sanitized logs.
+
+The smallest safe next step for background-auth recovery is a reviewed,
+version-specific SDK adapter or upstream SDK change that separately acknowledges
+socket/client closure and background-task termination before propagating the
+reader error. It must distinguish a reader error after confirmed teardown from
+a true close failure with deterministic tests. Until such evidence exists,
+operator intervention remains necessary for terminal cleanup failure. No SDK
+private-attribute inspection, message matching, or safety-latch bypass is used.
+
 An ES stall is a recovery heuristic, not proof of a broken connection. Unexpected
 exchange halts, entitlement problems, an unsuitable selected contract or sparse
 overnight quotes may still cause unnecessary attempts. A frozen upstream feed
