@@ -195,6 +195,8 @@ def test_listeners_record_receipt_and_preserve_subscriptions(observed, monkeypat
                 yield SimpleNamespace(event_symbol="XSP", price=None)
                 yield SimpleNamespace(event_symbol="XSP", price=50)
                 trades_done.set()
+                # The real SDK listener stays open until cancelled.
+                await asyncio.Event().wait()
 
     monkeypatch.setattr(tasty_worker, "DXLinkStreamer", FakeStreamer)
 

@@ -32,6 +32,19 @@ The systemd `EnvironmentFile` supplies `TASTYTRADE_CLIENT_SECRET`, `TASTYTRADE_R
 
 ## Verify
 
+The optional Phase 2 watchdog remains disabled unless `DXLINK_WATCHDOG_ENABLED=true`
+is supplied at worker construction. Review [configuration, calendar expiry, timing
+and rollback](WATCHDOG.md) before intentionally enabling it. It performs recovery
+inside Python, never restarts systemd, and introduces the `RECOVERING` status.
+The `tzdata` and explicit `anyio` requirements support timezone handling and SDK
+cleanup; account for dependencies in the existing isolated-environment rollout
+plan. Disabling the flag on the next intentional service start restores passive
+freshness reporting while retaining safer cleanup and fixed five-second retries.
+Watchdog-only settings are ignored when disabled. Cleanup pending for 30 seconds
+warns without forcing replacement; expired calendar coverage warns at most hourly
+when enabled and continues to suppress stall recovery.
+This document change does not deploy or change the VM's environment.
+
 On the VM, check service and proxy health without displaying environment values:
 
 ```sh
