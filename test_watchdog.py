@@ -377,6 +377,8 @@ def test_ordinary_recovery_requires_confirmed_streamer_exit(make_worker, monkeyp
     else:
         assert worker._closure_failed
         assert "closure unconfirmed; recovery suppressed" in caplog.text
+        assert "trigger=watchdog_stall trigger_exception_types=StreamStalled" in caplog.text
+        assert "connected_seconds=" in caplog.text
     assert "token-secret-marker" not in caplog.text
     assert "credential-secret-marker" not in caplog.text
 

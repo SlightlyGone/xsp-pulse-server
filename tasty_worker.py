@@ -29,6 +29,36 @@ class StreamerClosureFailed(Exception):
     """Streamer exit did not confirm closure; this worker must never reconnect."""
 
 
+def safe_exception_types(error: BaseException | None) -> str:
+    """Bounded group summary using fixed labels, never upstream text or names."""
+    labels = {
+        asyncio.CancelledError: "CancelledError", KeyboardInterrupt: "KeyboardInterrupt",
+        SystemExit: "SystemExit", StreamStalled: "StreamStalled",
+        StreamerClosureFailed: "StreamerClosureFailed", TastytradeError: "TastytradeError",
+        TimeoutError: "TimeoutError", OSError: "OSError", ConnectionError: "ConnectionError",
+        ValueError: "ValueError", RuntimeError: "RuntimeError",
+    }
+    remaining = 16
+
+    def summarize(exc: BaseException, depth: int) -> str:
+        nonlocal remaining
+        remaining -= 1
+        if isinstance(exc, BaseExceptionGroup):
+            label = "ExceptionGroup" if isinstance(exc, ExceptionGroup) else "BaseExceptionGroup"
+            if depth >= 4:
+                return label + "[truncated]"
+            children = []
+            for child in exc.exceptions:
+                if remaining <= 0:
+                    children.append("truncated")
+                    break
+                children.append(summarize(child, depth + 1))
+            return label + "[" + ",".join(children) + "]"
+        return labels.get(type(exc), "other")
+
+    return "none" if error is None else summarize(error, 0)
+
+
 def positive_seconds(name: str, default: float) -> float:
     try:
         value = float(os.environ.get(name, str(default)))
@@ -86,6 +116,9 @@ class XspPriceWorker:
         self._last_calendar_warning_at: float | None = None
         self._shutdown_requested = False
         self._closure_failed = False
+        self._connected_at: float | None = None
+        self._cleanup_trigger = "normal_exit"
+        self._cleanup_trigger_types = "none"
         self._lock = Lock()  # API reads run in FastAPI's thread pool.
         self.connection_status = "DISCONNECTED"
         self._received_at: dict[str, float] = {}
@@ -180,13 +213,36 @@ class XspPriceWorker:
             30, logger.warning, "Market data %s cleanup still pending after 30 seconds; replacement blocked", phase
         )
 
+    def _capture_cleanup_trigger(self, exc: BaseException) -> None:
+        self._cleanup_trigger = (
+            "watchdog_stall" if isinstance(exc, StreamStalled) else
+            "cancellation" if isinstance(exc, asyncio.CancelledError) else
+            "streamer_cleanup_failure" if isinstance(exc, StreamerClosureFailed) else
+            "listener_error" if self._connected_at is not None else "setup_error"
+        )
+        self._cleanup_trigger_types = safe_exception_types(exc)
+
+    def _log_cleanup_failure(self, message: str, error: BaseException) -> None:
+        now = self._monotonic()
+        connected_seconds = None if self._connected_at is None else max(0.0, now - self._connected_at)
+        # No exception objects, messages, tracebacks, payloads or dynamic type names.
+        logger.error(
+            "%s trigger=%s trigger_exception_types=%s exception_types=%s "
+            "connected_seconds=%s es_age_seconds=%s shutdown=%s",
+            message, "shutdown" if self._shutdown_requested else self._cleanup_trigger,
+            self._cleanup_trigger_types, safe_exception_types(error),
+            connected_seconds, self.observation_age("ES"), self._shutdown_requested,
+        )
+
     @asynccontextmanager
     async def _session_context(self, secret, refresh):
         manager = Session(provider_secret=secret, refresh_token=refresh, is_test=False)
         session = await manager.__aenter__()
         try:
             yield session
-        except BaseException as exc:
+        # Forward cancellation/process-exit exceptions through SDK cleanup too.
+        except BaseException as exc:  # noqa: BLE001
+            self._capture_cleanup_trigger(exc)
             if not await self._close_session(manager, type(exc), exc, exc.__traceback__):
                 raise
         else:
@@ -196,9 +252,12 @@ class XspPriceWorker:
         warning = self._schedule_cleanup_warning("Session HTTP client")
         try:
             return await manager.__aexit__(exc_type, exc, traceback)
-        except BaseException:
+        # Interrupted exit also leaves closure unconfirmed.
+        except BaseException as error:  # noqa: BLE001
             self._closure_failed = True
-            logger.error("Market data Session cleanup unconfirmed; recovery suppressed for worker lifetime")
+            self._log_cleanup_failure(
+                "Market data Session cleanup unconfirmed; recovery suppressed for worker lifetime", error
+            )
             raise StreamerClosureFailed from None
         finally:
             warning.cancel()
@@ -210,7 +269,9 @@ class XspPriceWorker:
         streamer = await manager.__aenter__()
         try:
             yield streamer
-        except BaseException as exc:
+        # Forward cancellation/process-exit exceptions through SDK cleanup too.
+        except BaseException as exc:  # noqa: BLE001
+            self._capture_cleanup_trigger(exc)
             if not await self._close_streamer(manager, type(exc), exc, exc.__traceback__):
                 raise
         else:
@@ -220,9 +281,12 @@ class XspPriceWorker:
         warning = self._schedule_cleanup_warning("DXLink streamer")
         try:
             return await manager.__aexit__(exc_type, exc, traceback)
-        except BaseException:
+        # Interrupted exit also leaves closure unconfirmed.
+        except BaseException as error:  # noqa: BLE001
             self._closure_failed = True
-            logger.error("Market data streamer closure unconfirmed; recovery suppressed for worker lifetime")
+            self._log_cleanup_failure(
+                "Market data streamer closure unconfirmed; recovery suppressed for worker lifetime", error
+            )
             raise StreamerClosureFailed from None
         finally:
             warning.cancel()
@@ -294,6 +358,9 @@ class XspPriceWorker:
         recovering = False
         while not self._shutdown_requested:
             connected_at = None
+            self._connected_at = None
+            self._cleanup_trigger = "normal_exit"
+            self._cleanup_trigger_types = "none"
             try:
                 self._set_all_status("RECOVERING" if recovering else "CONNECTING")
                 phase = "session setup"
@@ -327,6 +394,7 @@ class XspPriceWorker:
                         self._set_all_status("STREAMING")
                         recovering = False
                         connected_at = self._monotonic()
+                        self._connected_at = connected_at
 
                         async def listen_quotes(quote_map=quote_map) -> None:
                             async for quote in streamer.listen(Quote):
@@ -362,6 +430,7 @@ class XspPriceWorker:
                             # Exit the SDK's task group normally: otherwise some SDK
                             # versions wrap our deliberate stall in ExceptionGroup.
                             listener_error = exc
+                            self._capture_cleanup_trigger(exc)
                     if listener_error is not None:
                         raise listener_error
             except StreamerClosureFailed:

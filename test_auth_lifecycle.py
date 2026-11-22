@@ -222,4 +222,6 @@ def test_session_cleanup_error_is_terminal(credentials, monkeypatch, caplog):
     asyncio.run(run())
     assert attempts == [True]
     assert worker.connection_status == "CLEANUP_FAILED"
+    assert "trigger=setup_error trigger_exception_types=OSError exception_types=OSError" in caplog.text
+    assert "connected_seconds=None es_age_seconds=None shutdown=False" in caplog.text
     assert "secret-marker" not in caplog.text

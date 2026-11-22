@@ -115,7 +115,16 @@ has completed merely because a deadline elapsed.
 If SDK `__aexit__` raises (including cancellation or an exception group), closure
 is unconfirmed. The worker latches a terminal failure and reports `CLEANUP_FAILED`
 for all snapshots during ordinary operation, retaining the last prices and receipt
-timestamps. It logs only a fixed sanitized error. There are no retry sleeps or
+timestamps. It logs a sanitized error with the exit trigger, trigger and exit
+exception categories, elapsed seconds since subscriptions completed, ES receipt
+age, and shutdown flag. Missing duration/receipt values are `None`. Exception
+groups are summarized to at most 16 nodes and four nesting levels below the
+root, with `truncated` marking omitted detail. Types outside a fixed allowlist
+are `other`; messages, dynamic class names, exception chains and tracebacks are
+never logged. `normal_exit` means no local error initiated teardown; a background
+SDK failure may still emerge during exit. Session HTTP-client exit failures use
+the same diagnostics. These categories cannot prove token expiry or successful
+closure and do not alter recovery policy. There are no retry sleeps or
 replacement sessions, and neither elapsed cooldown nor another `start()` clears
 the latch. The SDK's enter and exit still execute on the owning worker task.
 An exception from streaming is distinguishable from an exception raised by exit:
